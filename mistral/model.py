@@ -12,6 +12,8 @@ from simple_parsing.helpers import Serializable
 from mistral.rope import precompute_freqs_cis, apply_rotary_emb
 from mistral.cache import CacheView, RotatingBufferCache
 from mistral.moe import MoeArgs, MoeLayer
+from mistral.rms_norm import rms_norm
+from mistral.quant_utils import activation_quant, weight_quant
 
 from xformers.ops.fmha import memory_efficient_attention
 
@@ -57,8 +59,20 @@ def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
 
 
 class BitLinear(nn.Linear):
-    # TODO
-    pass
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__(in_features, out_features, bias)
+        self.eps = 1e-5
+        self.norm = RMSNorm(out_features, eps=self.eps)
+        self.quantized_weight = None
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight
+        x_norm = self.norm(x)
+        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
+        w_quant = w + (weight_quant(w) - w).detach()
+        y = nn.functional.linear(x_quant, w_quant)
+        return y
 
 
 class Attention(nn.Module):
@@ -74,10 +88,10 @@ class Attention(nn.Module):
 
         self.scale = self.args.head_dim**-0.5
 
-        self.wq = BitLinear()
-        self.wk = BitLinear()
-        self.wv = BitLinear()
-        self.wo = BitLinear()
+        self.wq = BitLinear(args.dim, args.n_heads * args.head_dim, bias=False)
+        self.wk = BitLinear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wv = BitLinear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wo = BitLinear(args.n_heads * args.head_dim, args.dim, bias=False)
 
     def forward(
         self,
@@ -125,9 +139,9 @@ class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-        self.w1 = BitLinear()
-        self.w2 = BitLinear()
-        self.w3 = BitLinear()
+        self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, args.dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
@@ -139,12 +153,13 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    # def _norm(self, x: torch.Tensor) -> torch.Tensor:
+    #     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     # TODO: verify that BitNet doesn't use low precision here
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
+        # output = self._norm(x.float()).type_as(x)
+        output = rms_norm(x.float(), self.eps).type_as(x)
         return output * self.weight
 
 
@@ -155,8 +170,12 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.attention = Attention(args)
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        '''
+        Remove RMSNorm before attention and SwiGLU
+        because BitLinear has built-in RMSNorm
+        '''
+        # self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        # self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.args = args
 
         self.feed_forward: nn.Module
@@ -173,9 +192,12 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        # r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        # h = x + r
+        # r = self.feed_forward(self.ffn_norm(h))
+        r = self.attention.forward(x, freqs_cis, cache) 
         h = x + r
-        r = self.feed_forward(self.ffn_norm(h))
+        r = self.feed_forward(h)
         out = h * r
         return out
 
@@ -204,7 +226,7 @@ class Transformer(nn.Module):
             self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
         if pipeline_rank == num_pipeline_ranks - 1:
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-            self.output = BitLinear()
+            self.output = nn.Linear(args.dim, self.vocab_size, bias=False)
         # Initialize all layers but slice off those not of this rank.
         layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
         num_layers_per_rank = math.ceil(self.n_layers / self.num_pipeline_ranks)
