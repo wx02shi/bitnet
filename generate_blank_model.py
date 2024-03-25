@@ -27,7 +27,7 @@ model_args = ModelArgs(
     hidden_dim=hidden_dim,
     n_heads=n_heads,
     n_kv_heads=4,  # Adjust based on n_heads
-    norm_eps=1e-6,
+    norm_eps=1e-5,
     vocab_size=vocab_size,
     max_batch_size=max_batch_size
 )
