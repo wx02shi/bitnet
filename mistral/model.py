@@ -58,6 +58,9 @@ def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
     return keys, values
 
 
+'''
+Implement BitLinear
+'''
 class BitLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__(in_features, out_features, bias)
@@ -153,10 +156,13 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    '''
+    Use imported rms norm instead.
+    It should be the same thing, but just in case
+    '''
     # def _norm(self, x: torch.Tensor) -> torch.Tensor:
     #     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    # TODO: verify that BitNet doesn't use low precision here
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # output = self._norm(x.float()).type_as(x)
         output = rms_norm(x.float(), self.eps).type_as(x)
