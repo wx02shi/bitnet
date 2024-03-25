@@ -147,7 +147,9 @@ def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7,
         print(res[0])
         print("=====================")
 
-
+'''
+Quantize the weights in the BitLinear layers
+'''
 def quantize_model(model: Transformer):
     for name, module in model.named_modules():
         if isinstance(module, BitLinear):
