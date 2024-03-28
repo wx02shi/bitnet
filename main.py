@@ -8,23 +8,43 @@ from pathlib import Path
 
 from mistral.model import Transformer
 from mistral.tokenizer import Tokenizer
-from mistral.quant_utils import activation_norm_quant, gemm_lowbit_kernel
+from mistral.rms_norm import rms_norm
+from mistral.bitlinear import BitLinear
 
-'''
-BitLinear inference mode has different implementation
-'''
+
+def activation_norm_quant(x: torch.Tensor, eps: float = 1e-5):
+    x = rms_norm(x, eps)
+    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=eps)
+    y = (x * scale).round().clamp_(-128, 127)
+    return y, scale
+
+
+def gemm_lowbit_kernel(x: torch.Tensor, w: torch.Tensor):
+    """
+    The standard F.linear operation is replaced with a customized low-bit kernel.
+    This is not well-defined in the whitepapers...
+    Until I figure out CUDA injection, F.linear is used as a placeholder
+    """
+    y = torch.nn.functional.linear(x, w)
+    return y
+
+
 class BitLinear(nn.Linear):
+    """
+    BitLinear inference mode has different implementation
+    """
+
     def __init__(self, in_features, out_features, bias=True):
+
         super().__init__(in_features, out_features, bias)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
+        print(self.weight_scale)
         w_scale = self.weight_scale
         x_quant, x_scale = activation_norm_quant(x)
         y = gemm_lowbit_kernel(x_quant, w) / w_scale / x_scale
         return y
-
-
 
 
 def sample_top_p(probs: torch.Tensor, p: float):
@@ -50,7 +70,15 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float):
 
 
 @torch.inference_mode()
-def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, max_tokens: int,  temperature: float, chunk_size: int = None):
+def generate(
+    prompts: List[str],
+    model: Transformer,
+    tokenizer: Tokenizer,
+    *,
+    max_tokens: int,
+    temperature: float,
+    chunk_size: int = None,
+):
     model = model.eval()
     B, V = len(prompts), model.args.vocab_size
 
@@ -60,7 +88,10 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
 
     # Cache
     cache_window = max(seqlens) + max_tokens
-    if model.args.sliding_window is not None and cache_window > model.args.sliding_window:
+    if (
+        model.args.sliding_window is not None
+        and cache_window > model.args.sliding_window
+    ):
         cache_window = model.args.sliding_window
     cache = RotatingBufferCache(
         model.n_local_layers,
@@ -71,7 +102,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     )
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
-    
+
     # Bookkeeping
     logprobs = [[] for _ in range(B)]
     last_token_prelogits = None
@@ -83,12 +114,12 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
 
     # Encode prompt by chunks
     for s in range(0, max_prompt_len, chunk_size):
-        prompt_chunks = [p[s:s+chunk_size] for p in encoded_prompts]
+        prompt_chunks = [p[s : s + chunk_size] for p in encoded_prompts]
         assert all(len(p) > 0 for p in prompt_chunks)
         prelogits = model.forward(
             torch.tensor(sum(prompt_chunks, []), device=model.device, dtype=torch.long),
             seqlens=[len(p) for p in prompt_chunks],
-            cache=cache
+            cache=cache,
         )
         logits = torch.log_softmax(prelogits, dim=-1)
 
@@ -96,14 +127,27 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
             # Pass > 1
             last_token_logits = torch.log_softmax(last_token_prelogits, dim=-1)
             for i_seq in range(B):
-                logprobs[i_seq].append(last_token_logits[i_seq, prompt_chunks[i_seq][0]].item())
+                logprobs[i_seq].append(
+                    last_token_logits[i_seq, prompt_chunks[i_seq][0]].item()
+                )
 
         offset = 0
         for i_seq, sequence in enumerate(prompt_chunks):
-            logprobs[i_seq].extend([logits[offset + i, sequence[i + 1]].item() for i in range(len(sequence) - 1)])
+            logprobs[i_seq].extend(
+                [
+                    logits[offset + i, sequence[i + 1]].item()
+                    for i in range(len(sequence) - 1)
+                ]
+            )
             offset += len(sequence)
 
-        last_token_prelogits = prelogits.index_select(0, torch.tensor([len(p) for p in prompt_chunks], device=prelogits.device).cumsum(dim=0) - 1)
+        last_token_prelogits = prelogits.index_select(
+            0,
+            torch.tensor(
+                [len(p) for p in prompt_chunks], device=prelogits.device
+            ).cumsum(dim=0)
+            - 1,
+        )
         assert last_token_prelogits.shape == (B, V)
 
     # decode
@@ -117,7 +161,9 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
             logprobs[i].append(last_token_logits[i, next_token[i]].item())
 
         generated_tokens.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * len(prompts), cache=cache)
+        last_token_prelogits = model.forward(
+            next_token, seqlens=[1] * len(prompts), cache=cache
+        )
         assert last_token_prelogits.shape == (B, V)
 
     generated_words = []
@@ -129,9 +175,34 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     return generated_words, logprobs
 
 
-def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7, instruct: bool = False):
+def quantize_model(model: Transformer):
+    """
+    Quantize the weights offline
+    """
+    for name, module in model.named_modules():
+        print(name, module)
+        if isinstance(module, BitLinear):
+            module.weight_scale = module.weight.abs().mean().clamp_(min=1e-5)
+            module.weight = (
+                (module.weight * module.weight_scale).round().clamp(-1, 1)
+                / module.weight_scale
+            ).to(torch.int8)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    return model
+
+
+def interactive(
+    model_path: str,
+    max_tokens: int = 35,
+    temperature: float = 0.7,
+    instruct: bool = False,
+):
     tokenizer = Tokenizer(str(Path(model_path) / "tokenizer.model"))
     transformer = Transformer.from_folder(Path(model_path), max_batch_size=3)
+    transformer = quantize_model(transformer)
 
     while True:
         prompt = input("Prompt: ")
@@ -146,20 +217,6 @@ def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7,
         )
         print(res[0])
         print("=====================")
-
-'''
-Quantize the weights in the BitLinear layers
-'''
-def quantize_model(model: Transformer):
-    for name, module in model.named_modules():
-        if isinstance(module, BitLinear):
-            module.weight_scale = module.weight.abs().mean().clamp_(min=1e-5)
-            module.weight = ((module.weight * module.weight_scale).round().clamp(-1, 1) / module.weight_scale).to(torch.int8)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    return model
 
 
 def demo(
@@ -189,14 +246,17 @@ def demo(
         temperature=temperature,
     )
     if should_print:
-        for x,l in zip(res, _logprobs):
+        for x, l in zip(res, _logprobs):
             print(x)
-            logging.debug('Logprobs: %s',l)
+            logging.debug("Logprobs: %s", l)
             print("=====================")
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    fire.Fire({
-        "interactive": interactive,
-        "demo": demo,
-    })
+    fire.Fire(
+        {
+            "interactive": interactive,
+            "demo": demo,
+        }
+    )

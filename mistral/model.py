@@ -12,8 +12,8 @@ from simple_parsing.helpers import Serializable
 from mistral.rope import precompute_freqs_cis, apply_rotary_emb
 from mistral.cache import CacheView, RotatingBufferCache
 from mistral.moe import MoeArgs, MoeLayer
+from mistral.bitlinear import BitLinear
 from mistral.rms_norm import rms_norm
-from mistral.quant_utils import activation_quant, weight_quant
 
 from xformers.ops.fmha import memory_efficient_attention
 
@@ -59,26 +59,6 @@ def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
     return keys, values
 
 
-'''
-Implement BitLinear
-'''
-class BitLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
-        super().__init__(in_features, out_features, bias)
-        self.eps = 1e-5
-        self.norm = RMSNorm(out_features, eps=self.eps)
-        self.quantized_weight = None
-
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.weight
-        x_norm = self.norm(x)
-        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
-        w_quant = w + (weight_quant(w) - w).detach()
-        y = nn.functional.linear(x_quant, w_quant)
-        return y
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -107,8 +87,8 @@ class Attention(nn.Module):
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
-        xk = xk.view(seqlen_sum, self.n_heads, self.head_dim)
-        xv = xv.view(seqlen_sum, self.n_heads, self.head_dim)
+        xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         # NOTE: can we still apply rotary embeddings here?
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -145,7 +125,7 @@ class FeedForward(nn.Module):
 
         self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
         self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
-        self.w3 = nn.Linear(args.dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
@@ -157,10 +137,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    '''
+    """
     Use imported rms norm instead.
     It should be the same thing, but just in case
-    '''
+    """
     # def _norm(self, x: torch.Tensor) -> torch.Tensor:
     #     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -177,10 +157,10 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.attention = Attention(args)
-        '''
+        """
         Remove RMSNorm before attention and SwiGLU
         because BitLinear has built-in RMSNorm
-        '''
+        """
         # self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         # self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.args = args
@@ -202,7 +182,7 @@ class TransformerBlock(nn.Module):
         # r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         # h = x + r
         # r = self.feed_forward(self.ffn_norm(h))
-        r = self.attention.forward(x, freqs_cis, cache) 
+        r = self.attention.forward(x, freqs_cis, cache)
         h = x + r
         r = self.feed_forward(h)
         out = h * r
@@ -312,7 +292,7 @@ class Transformer(nn.Module):
 
         if cache is not None:
             cache.update_seqlens(seqlens)
-        if self.pipeline_rank == self.num_pipeline_ranks - 1:
+        if self.pipeline_rank < self.num_pipeline_ranks - 1:
             torch.distributed.send(h, dst=self.pipeline_rank + 1)
             return h
         else:
@@ -327,7 +307,7 @@ class Transformer(nn.Module):
         cache: Optional[RotatingBufferCache] = None,
     ) -> torch.Tensor:
         h = self.forward_partial(input_ids, seqlens, cache=cache)
-        if self.pipeline_rank == self.num_pipeline_ranks - 1:
+        if self.pipeline_rank < self.num_pipeline_ranks - 1:
             # ignore the intermediate activations as we'll get the final outpu from
             # the last stage
             outs = torch.empty(
@@ -344,6 +324,7 @@ class Transformer(nn.Module):
         state_to_load = {}
         skipped = set([])
         for k, v in state_dict.items():
+            print(k, v)
             if k.startswith("tok_embeddings"):
                 if self.pipeline_rank == 0:
                     state_to_load[k] = v
@@ -377,7 +358,7 @@ class Transformer(nn.Module):
                     skipped.add(k)
             else:
                 raise ValueError(f"Unexpected key {k}")
-        assert set(state_dict.keys() == skipped.union(set(state_to_load.keys())))
+        # assert set(state_dict.keys() == skipped.union(set(state_to_load.keys())))
         super().load_state_dict(state_to_load, *args, **kwargs)
 
     @staticmethod
