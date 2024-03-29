@@ -142,7 +142,7 @@ def generate(
 
 def quantize_model(model: Transformer):
     """
-    Quantize the weights offline
+    Quantize the weights offline, before performing inference
     """
     for name, module in model.named_modules():
         if isinstance(module, BitLinear):

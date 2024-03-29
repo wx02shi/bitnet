@@ -34,17 +34,6 @@ model_args = ModelArgs(
 
 model = Transformer(model_args)
 
-# Without training, generated model will not have
-# ternarized weights and quantized activations.
-# Ternarize and quantize after generation
-for name, module in model.named_modules():
-    if isinstance(module, BitLinear):
-        module.weight = nn.Parameter(weight_quant(module.weight))
-
-for name, module in model.named_modules():
-    if isinstance(module, nn.Linear) and not isinstance(module, BitLinear):
-        module.forward = lambda x: activation_quant(module(x))
-
 output_folder = Path("models/mistral_bitnet_7B")
 output_folder.mkdir(parents=True, exist_ok=True)
 
