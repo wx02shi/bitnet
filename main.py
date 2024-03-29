@@ -186,7 +186,7 @@ def quantize_model(model: Transformer):
             module.weight_scale = module.weight.abs().mean().clamp_(min=1e-5)
             module.quantized_weight = nn.Parameter(
                 (module.weight * module.weight_scale).round().clamp_(-1, 1)
-            ).to(torch.int8)
+            )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
