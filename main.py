@@ -12,39 +12,40 @@ from mistral.rms_norm import rms_norm
 from mistral.bitlinear import BitLinear
 
 
-def activation_norm_quant(x: torch.Tensor, eps: float = 1e-5):
-    x = rms_norm(x, eps)
-    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=eps)
-    y = (x * scale).round().clamp_(-128, 127)
-    return y, scale
+# def activation_norm_quant(x: torch.Tensor, eps: float = 1e-5):
+#     x = rms_norm(x, eps)
+#     scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=eps)
+#     y = (x * scale).round().clamp_(-128, 127)
+#     return y, scale
 
 
-def gemm_lowbit_kernel(x: torch.Tensor, w: torch.Tensor):
-    """
-    The standard F.linear operation is replaced with a customized low-bit kernel.
-    This is not well-defined in the whitepapers...
-    Until I figure out CUDA injection, F.linear is used as a placeholder
-    """
-    y = torch.nn.functional.linear(x, w)
-    return y
+# def gemm_lowbit_kernel(x: torch.Tensor, w: torch.Tensor):
+#     """
+#     The standard F.linear operation is replaced with a customized low-bit kernel.
+#     This is not well-defined in the whitepapers...
+#     Until I figure out CUDA injection, F.linear is used as a placeholder
+#     """
+#     y = torch.nn.functional.linear(x, w)
+#     return y
 
 
-class BitLinear(nn.Linear):
-    """
-    BitLinear inference mode has different implementation
-    """
+# class BitLinear(nn.Linear):
+#     """
+#     BitLinear inference mode has different implementation
+#     """
 
-    def __init__(self, in_features, out_features, bias=True):
+#     def __init__(self, in_features, out_features, bias=True):
 
-        super().__init__(in_features, out_features, bias)
+#         super().__init__(in_features, out_features, bias)
+#         self.weight_scale = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.weight
-        print(self.weight_scale)
-        w_scale = self.weight_scale
-        x_quant, x_scale = activation_norm_quant(x)
-        y = gemm_lowbit_kernel(x_quant, w) / w_scale / x_scale
-        return y
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         w = self.weight
+#         print(self.weight_scale)
+#         w_scale = self.weight_scale
+#         x_quant, x_scale = activation_norm_quant(x)
+#         y = gemm_lowbit_kernel(x_quant, w) / w_scale / x_scale
+#         return y
 
 
 def sample_top_p(probs: torch.Tensor, p: float):
@@ -183,9 +184,8 @@ def quantize_model(model: Transformer):
         print(name, module)
         if isinstance(module, BitLinear):
             module.weight_scale = module.weight.abs().mean().clamp_(min=1e-5)
-            module.weight = (
-                (module.weight * module.weight_scale).round().clamp(-1, 1)
-                / module.weight_scale
+            module.quantized_weight = nn.Parameter(
+                (module.weight * module.weight_scale).round().clamp_(-1, 1)
             ).to(torch.int8)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
