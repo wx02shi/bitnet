@@ -38,13 +38,10 @@ class BitLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__(in_features, out_features, bias)
         self.eps = 1e-5
-        self.quantized_weight = None
-        self.weight_scale = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.quantized_weight is None and self.weight_scale is None:
+        if self.training:
             w = self.weight
-            # x_norm = self.norm(x)
             x_norm = rms_norm(x, eps=self.eps)
             x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
             w_quant = w + (weight_quant(w) - w).detach()
@@ -52,7 +49,7 @@ class BitLinear(nn.Linear):
             return y
 
         else:
-            w = self.quantized_weight
+            w = self.weight
             w_scale = self.weight_scale
             x_quant, x_scale = activation_norm_quant(x)
             y = gemm_lowbit_kernel(x_quant, w) / w_scale / x_scale

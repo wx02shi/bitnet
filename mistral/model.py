@@ -324,7 +324,6 @@ class Transformer(nn.Module):
         state_to_load = {}
         skipped = set([])
         for k, v in state_dict.items():
-            print(k, v)
             if k.startswith("tok_embeddings"):
                 if self.pipeline_rank == 0:
                     state_to_load[k] = v
