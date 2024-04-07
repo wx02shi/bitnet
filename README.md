@@ -1,4 +1,4 @@
-# mistral-bitnet
+# bitnet
 
 This is an exploration, where I attempted to implement the BitNet b1.58 model, using the [`mistral-src`](https://github.com/mistralai/mistral-src/tree/main) repository as a base.
 
