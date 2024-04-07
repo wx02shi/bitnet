@@ -1,22 +1,16 @@
 # mistral-bitnet
 
-Implementing the BitNet b1.58 model, using the [`mistral-src`](https://github.com/mistralai/mistral-src/tree/main) repository as a base.
+This is an exploration, where I attempted to implement the BitNet b1.58 model, using the [`mistral-src`](https://github.com/mistralai/mistral-src/tree/main) repository as a base.
 
-Currently, there is no implementation for `gemm_lowbit_kernel`. I can't figure it out. As a result, during inference mode, the weights and activations are still type `float16`, because PyTorch does not support matrix multiplication for `int8`.  
-In theory, this implementation should produce the same outputs as a correct BitNet, but without the efficiency gains.
+The [whitepaper](https://arxiv.org/pdf/2402.17764.pdf) illustrates some promising results. Inference is much lighter, with negligible degradation to accuracy, and significantly outperforms popular post-quantization techniques.  
 
-> NOTE: For convenience, there should be two model definitions: one with the training mode of BitLinear, and one with the inference mode. Generation scripts should load the inference-mode model.  
-> Training scripts should load the training-mode model, and then after training, replace the training BitLinears with inference BitLinears.  
-> The current implementation just has an `if self.training`. But having two different definitions will save on space and latency during inference
+Interestingly, they did not provide any figures for training loss with respect to training time, but they do provide figures for scaling law of loss versus model size. 
 
-## Motivation
-The original whitepaper [The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits](https://arxiv.org/pdf/2402.17764.pdf) used "LLaMA-alike components". From a naive perspective, there are few differences between the architectures of LLaMA and Mistral (especially with respect to BitNet quantization). 
+Due to my limited attention span (and exams), I did not implement the following:
+- NVIDIA FasterTransformer (because I built on Mistral first)
+- Ladder 2-bit kernel (I could not find the referenced whitepaper anyways)
+- Pre-trained model, or a pre-training script (GPU-poor)
 
-Credits to @nkotak, who quickly put out the (imo) best implementation of the whitepaper. I would not have been able to create this project without reading it over and having some chats about working with it, they have helped me to digest the contents much faster!  
-Check out [their repo](https://github.com/nkotak/1.58BitNet), especially if you want to run a BitNet on Apple silicon. 
+I could spend some additional time to implement a 2-bit kernel. PyTorch (or perhaps CUDA) does not support `int8` matrix multiplication, and my intuition tells me that I won't be implementing an efficient kernel by my own skill. Without an efficient kernel, BitNet is pretty much pointless. 
 
-I chose to build a BitNet model based on the [`mistral-src`](https://github.com/mistralai/mistral-src/tree/main) repository. While I admire nkotak's work, my intuition says BitNet is still not good enough for ARM processors. GPU is still favourable, both in terms of raw computational power as well as existing optimizations. E.g. `xformers`, sliding window attention, and possibly Paged Attention or Flash Attention.  
-Secondly, I wanted to explore how BitNet quantization interacts with MoE.  
-
-## Overview
-(TODO)
+but in reality this project cannot progress much further. One setback of bitnet is that it changes the architecture of the attention layer. This means that we cannot use weights from existing models, and so a useful bitnet model must be pre-trained. I do not have the hardware, time, or money to do this.
